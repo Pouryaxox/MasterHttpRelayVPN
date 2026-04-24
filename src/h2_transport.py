@@ -20,6 +20,11 @@ import socket
 import ssl
 from urllib.parse import urlparse
 
+try:
+    import certifi
+except Exception:  # optional dependency fallback
+    certifi = None
+
 import codec
 
 log = logging.getLogger("H2")
@@ -62,10 +67,15 @@ class H2Transport:
     """
 
     def __init__(self, connect_host: str, sni_host: str,
-                 verify_ssl: bool = True):
+                 verify_ssl: bool = True,
+                 sni_hosts: list[str] | None = None):
         self.connect_host = connect_host
         self.sni_host = sni_host
         self.verify_ssl = verify_ssl
+        # Optional SNI rotation pool — picked round-robin on each new connect.
+        # Falls back to the single sni_host if no pool is given.
+        self._sni_hosts: list[str] = [h for h in (sni_hosts or []) if h] or [sni_host]
+        self._sni_idx: int = 0
 
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
@@ -75,6 +85,7 @@ class H2Transport:
         self._write_lock = asyncio.Lock()
         self._connect_lock = asyncio.Lock()
         self._read_task: asyncio.Task | None = None
+        self._conn_generation = 0
 
         # Per-stream tracking
         self._streams: dict[int, _StreamState] = {}
@@ -101,11 +112,24 @@ class H2Transport:
     async def _do_connect(self):
         """Establish the HTTP/2 connection with optimized socket settings."""
         ctx = ssl.create_default_context()
+        # Some Python builds don't expose a usable default CA store.
+        # Load certifi bundle when present to keep TLS verification stable.
+        if certifi is not None:
+            try:
+                ctx.load_verify_locations(cafile=certifi.where())
+            except Exception:
+                pass
         # Advertise both h2 and http/1.1 — some DPI blocks h2-only ALPN
         ctx.set_alpn_protocols(["h2", "http/1.1"])
         if not self.verify_ssl:
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
+
+        # Pick next SNI from the rotation pool so repeated reconnects
+        # don't fingerprint as "always www.google.com".
+        sni = self._sni_hosts[self._sni_idx % len(self._sni_hosts)]
+        self._sni_idx += 1
+        self.sni_host = sni  # kept for backward-compat logging
 
         # Create raw TCP socket with TCP_NODELAY BEFORE TLS handshake.
         # Nagle's algorithm can delay small writes (H2 frames) by up to 200ms
@@ -116,7 +140,7 @@ class H2Transport:
 
         try:
             await asyncio.wait_for(
-                asyncio.get_event_loop().sock_connect(
+                asyncio.get_running_loop().sock_connect(
                     raw, (self.connect_host, 443)
                 ),
                 timeout=15,
@@ -124,7 +148,7 @@ class H2Transport:
             self._reader, self._writer = await asyncio.wait_for(
                 asyncio.open_connection(
                     ssl=ctx,
-                    server_hostname=self.sni_host,
+                    server_hostname=sni,
                     sock=raw,
                 ),
                 timeout=15,
@@ -163,26 +187,34 @@ class H2Transport:
         await self._flush()
 
         self._connected = True
-        self._read_task = asyncio.create_task(self._reader_loop())
+        self._conn_generation += 1
+        generation = self._conn_generation
+        self._read_task = asyncio.create_task(self._reader_loop(generation))
         log.info("H2 connected → %s (SNI=%s, TCP_NODELAY=on)",
-                 self.connect_host, self.sni_host)
+                 self.connect_host, sni)
 
     async def reconnect(self):
         """Close current connection and re-establish."""
-        await self._close_internal()
-        await self._do_connect()
+        async with self._connect_lock:
+            await self._close_internal()
+            await self._do_connect()
 
     async def _close_internal(self):
         self._connected = False
-        if self._read_task:
-            self._read_task.cancel()
-            self._read_task = None
+        read_task = self._read_task
+        self._read_task = None
+        if read_task:
+            read_task.cancel()
+            await asyncio.gather(read_task, return_exceptions=True)
         if self._writer:
             try:
-                self._writer.close()
+                writer = self._writer
+                self._writer = None
+                writer.close()
+                await writer.wait_closed()
             except Exception:
                 pass
-            self._writer = None
+        self._reader = None
         # Wake all pending streams so they can raise
         for state in self._streams.values():
             state.error = "Connection closed"
@@ -316,7 +348,7 @@ class H2Transport:
 
     # ── Background reader ─────────────────────────────────────────
 
-    async def _reader_loop(self):
+    async def _reader_loop(self, generation: int):
         """Background: read H2 frames, dispatch events to waiting streams."""
         try:
             while self._connected:
@@ -340,15 +372,30 @@ class H2Transport:
 
         except asyncio.CancelledError:
             pass
+        except ssl.SSLError as e:
+            # APPLICATION_DATA_AFTER_CLOSE_NOTIFY is raised when the server
+            # sends data after its TLS close_notify — technically a protocol
+            # violation but very common with CDNs.  It just means the
+            # connection is closed; reconnect on the next request.
+            if "APPLICATION_DATA_AFTER_CLOSE_NOTIFY" in str(e):
+                log.debug("H2 TLS session closed by remote (close_notify): %s", e)
+            else:
+                log.error("H2 reader error: %s", e)
         except Exception as e:
-            log.error("H2 reader error: %s", e)
+            if "application data after close notify" in str(e).lower():
+                log.debug("H2 reader closed after close_notify: %s", e)
+            else:
+                log.error("H2 reader error: %s", e)
         finally:
-            self._connected = False
-            for state in self._streams.values():
-                if not state.done.is_set():
-                    state.error = "Connection lost"
-                    state.done.set()
-            log.info("H2 reader loop ended")
+            if generation != self._conn_generation:
+                log.debug("H2 reader loop ended for stale generation %d", generation)
+            else:
+                self._connected = False
+                for state in self._streams.values():
+                    if not state.done.is_set():
+                        state.error = "Connection lost"
+                        state.done.set()
+                log.info("H2 reader loop ended")
 
     def _dispatch(self, event):
         """Route a single h2 event to its stream."""
