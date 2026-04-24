@@ -97,7 +97,7 @@ GOOGLE_OWNED_EXACT = frozenset({
 # the same edge IP as `front_domain`. Routed through the configured
 # `google_ip` with SNI rewritten.
 SNI_REWRITE_SUFFIXES: tuple[str, ...] = (
-    "youtube.com",
+    "m.youtube.com",
     "youtu.be",
     "youtube-nocookie.com",
     "ytimg.com",
